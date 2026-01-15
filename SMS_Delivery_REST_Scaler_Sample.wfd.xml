@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SAMPLE Quadient Scaler Workflow Definition (WFD) - SMS Delivery (REST API)
+
+  Notes:
+  - Scaler WFD schemas vary by Scaler version and installation.
+  - This file is a practical TEMPLATE showing the common module chain and Groovy
+    you can paste into Scaler Script modules.
+  - Replace placeholders like ${...} / ACXXXXX / BASE64_AUTH / FROM_NUMBER.
+  - If your Scaler expects a different XML root/attributes, keep the module order
+    and scripts, and recreate the modules in the Scaler UI accordingly.
+-->
+<workflow name="SMS_Delivery_REST" version="1.0">
+  <description>
+    Input (XML) -> Validate -> Compose -> Send SMS (REST) -> Audit Log -> Route Success/Failure
+  </description>
+
+  <!-- =========================
+       GLOBAL PARAMETERS
+       ========================= -->
+  <parameters>
+    <!-- SMS Provider -->
+    <param name="SMS_API_URL" value="https://api.twilio.com/2010-04-01/Accounts/ACXXXXX/Messages.json"/>
+    <param name="SMS_AUTH_HEADER" value="Basic BASE64_ENCODED_CREDENTIALS"/>
+    <param name="SMS_FROM_NUMBER" value="+18005550000"/>
+
+    <!-- Logging -->
+    <param name="AUDIT_LOG_PATH" value="C:\Scaler\logs\sms_audit.log"/>
+  </parameters>
+
+  <!-- =========================
+       MODULES
+       ========================= -->
+  <modules>
+
+    <!-- 1) INPUT MODULE -->
+    <module id="m1" type="Input.XML" name="Input XML">
+      <config>
+        <!-- Point to an input folder or connector configured in Scaler -->
+        <inputFolder>C:\Scaler\in\sms</inputFolder>
+        <filePattern>*.xml</filePattern>
+      </config>
+      <outputs>
+        <output name="doc"/>
+      </outputs>
+    </module>
+
+    <!-- 2) GROOVY: PARSE + VALIDATE -->
+    <module id="m2" type="Script.Groovy" name="Validate Phone + Consent">
+      <inputs>
+        <input name="doc" from="m1:doc"/>
+      </inputs>
+      <outputs>
+        <output name="ctx"/>
+      </outputs>
+      <script><![CDATA[
+import groovy.xml.XmlSlurper
+
+// ---- Read XML from upstream (Scaler will pass file content; adapt as needed) ----
+def xmlText = doc?.toString()
+def root = new XmlSlurper(false,false).parseText(xmlText)
+
+// ---- Extract fields (adjust XPaths to match your XML) ----
+def phone   = root?.customer?.phone?.text()?.trim()
+def consent = root?.customer?.smsConsent?.text()?.trim()?.toLowerCase() in ["true","yes","y","1"]
+def msg     = root?.message?.text()?.trim()
+
+// ---- Basic validation ----
+if (!consent) throw new RuntimeException("SMS consent not granted")
+if (!phone)   throw new RuntimeException("Missing phone number")
+if (!phone.startsWith("+")) throw new RuntimeException("Phone must be in E.164 format (e.g., +19165551234)")
+if (!msg)     throw new RuntimeException("Missing message body")
+
+// ---- Build a context map for downstream modules ----
+def ctx = [
+  phone: phone,
+  message: msg,
+  correlationId: (root?.correlationId?.text() ?: UUID.randomUUID().toString()),
+  customerId: (root?.customer?.id?.text() ?: ""),
+  sourceFile: (root?.sourceFile?.text() ?: "")
+]
+return ctx
+      ]]></script>
+    </module>
+
+    <!-- 3) GROOVY: SEND SMS (REST) -->
+    <module id="m3" type="Script.Groovy" name="Send SMS (REST)">
+      <inputs>
+        <input name="ctx" from="m2:ctx"/>
+      </inputs>
+      <outputs>
+        <output name="result"/>
+      </outputs>
+      <script><![CDATA[
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+// ---- Pull parameters (Scaler may expose workflow params differently; adapt) ----
+def API_URL = SMS_API_URL
+def AUTH    = SMS_AUTH_HEADER
+def FROM    = SMS_FROM_NUMBER
+
+def toNumber = ctx.phone
+def messageText = ctx.message
+
+// ---- Build x-www-form-urlencoded body (Twilio-style). For other providers, change body + headers. ----
+def body =
+  "To="   + URLEncoder.encode(toNumber, "UTF-8") +
+  "&From="+ URLEncoder.encode(FROM, "UTF-8") +
+  "&Body="+ URLEncoder.encode(messageText, "UTF-8")
+
+URL url = new URL(API_URL)
+HttpURLConnection conn = (HttpURLConnection) url.openConnection()
+conn.setRequestMethod("POST")
+conn.setDoOutput(true)
+conn.setRequestProperty("Authorization", AUTH)
+conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+
+conn.outputStream.withCloseable { it.write(body.bytes) }
+
+def code = conn.responseCode
+def responseText = ""
+try {
+  responseText = conn.inputStream?.text
+} catch (Exception e) {
+  responseText = conn.errorStream?.text ?: e.message
+}
+
+def ok = (code >= 200 && code < 300)
+
+return [
+  ok: ok,
+  httpCode: code,
+  providerResponse: responseText,
+  correlationId: ctx.correlationId,
+  phone: toNumber,
+  customerId: ctx.customerId
+]
+      ]]></script>
+    </module>
+
+    <!-- 4) GROOVY: AUDIT LOG -->
+    <module id="m4" type="Script.Groovy" name="Audit Log">
+      <inputs>
+        <input name="result" from="m3:result"/>
+      </inputs>
+      <outputs>
+        <output name="result2"/>
+      </outputs>
+      <script><![CDATA[
+def logPath = AUDIT_LOG_PATH
+
+def ts = new Date().format("yyyy-MM-dd HH:mm:ss")
+def maskedPhone = result.phone?.replaceAll(/\d(?=\d{4})/, "*")
+
+def line = "${ts} | corr=${result.correlationId} | cust=${result.customerId} | phone=${maskedPhone} | ok=${result.ok} | http=${result.httpCode}\n"
+new File(logPath).getParentFile().mkdirs()
+new File(logPath) << line
+
+return result
+      ]]></script>
+    </module>
+
+    <!-- 5) ROUTER: SUCCESS / FAILURE -->
+    <module id="m5" type="Router" name="Route by result.ok">
+      <inputs>
+        <input name="result" from="m4:result2"/>
+      </inputs>
+      <routes>
+        <route name="success" when="${result.ok == true}"/>
+        <route name="failure" when="${result.ok == false}"/>
+      </routes>
+    </module>
+
+    <!-- 6A) OUTPUT: SUCCESS ARCHIVE -->
+    <module id="m6" type="Output.File" name="Archive Success">
+      <inputs>
+        <input name="result" from="m5:success"/>
+      </inputs>
+      <config>
+        <outputFolder>C:\Scaler\out\sms\success</outputFolder>
+        <fileNamePattern>sms_ok_${result.correlationId}.json</fileNamePattern>
+      </config>
+      <writer><![CDATA[
+import groovy.json.JsonOutput
+return JsonOutput.prettyPrint(JsonOutput.toJson(result))
+      ]]></writer>
+    </module>
+
+    <!-- 6B) OUTPUT: FAILURE + OPTIONAL EMAIL FALLBACK PLACEHOLDER -->
+    <module id="m7" type="Output.File" name="Archive Failure">
+      <inputs>
+        <input name="result" from="m5:failure"/>
+      </inputs>
+      <config>
+        <outputFolder>C:\Scaler\out\sms\failure</outputFolder>
+        <fileNamePattern>sms_fail_${result.correlationId}.json</fileNamePattern>
+      </config>
+      <writer><![CDATA[
+import groovy.json.JsonOutput
+return JsonOutput.prettyPrint(JsonOutput.toJson(result))
+      ]]></writer>
+    </module>
+
+  </modules>
+
+  <!-- =========================
+       WIRES / CONNECTIONS
+       ========================= -->
+  <connections>
+    <connect from="m1:doc" to="m2:doc"/>
+    <connect from="m2:ctx" to="m3:ctx"/>
+    <connect from="m3:result" to="m4:result"/>
+    <connect from="m4:result2" to="m5:result"/>
+    <connect from="m5:success" to="m6:result"/>
+    <connect from="m5:failure" to="m7:result"/>
+  </connections>
+
+</workflow>
